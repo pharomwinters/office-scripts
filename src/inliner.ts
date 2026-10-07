@@ -19,6 +19,7 @@ import * as path from 'path';
  *   - `import * as ns from ...` namespace imports
  *   - Default imports
  *   - Non-relative imports (node_modules, bare specifiers)
+ *   - Aliased imports (`import { a as b }`)
  */
 
 /**
@@ -116,7 +117,16 @@ function collectImports(fileName: string, text: string, warnings: string[]): Imp
                 warnings.push(`Skipped namespace import from "${specifier}"`);
             } else if (ts.isNamedImports(clause.namedBindings)) {
                 for (const el of clause.namedBindings.elements) {
-                    names.push(el.propertyName?.text ?? el.name.text);
+                    // `{ a as b }`: the inlined declaration keeps the name `a`
+                    // while the importer calls `b`, so inlining would emit a
+                    // script referencing an undefined name. Refuse it loudly.
+                    if (el.propertyName && el.propertyName.text !== el.name.text) {
+                        warnings.push(
+                            `Skipped aliased import "${el.propertyName.text} as ${el.name.text}" from "${specifier}" — import it by its original name`,
+                        );
+                        continue;
+                    }
+                    names.push(el.name.text);
                 }
             }
         }
