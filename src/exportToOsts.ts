@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { inlineImportsToText } from './inlineImports';
+import { inlineImportsToText } from './inliner';
 import { hasOfficeScriptMarker, OFFICE_SCRIPT_MARKER } from './marker';
 
 /**
