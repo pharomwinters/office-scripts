@@ -79,9 +79,11 @@ function extractDeclarationText(
 ): string {
     const jsDocs = (stmt as unknown as { jsDoc?: ts.JSDoc[] }).jsDoc;
     const start = jsDocs && jsDocs.length > 0 ? jsDocs[0].getStart() : stmt.getStart();
-    let text = source.slice(start, stmt.getEnd());
-    text = text.replace(/^(\s*)export\s+/, '$1');
-    return text;
+    // getStart() skips JSDoc, so strip `export` from the declaration itself —
+    // anchoring the regex on the full slice misses it whenever a JSDoc precedes.
+    const docText = source.slice(start, stmt.getStart());
+    const declText = source.slice(stmt.getStart(), stmt.getEnd()).replace(/^export\s+/, '');
+    return docText + declText;
 }
 
 /**
