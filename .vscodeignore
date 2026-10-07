@@ -1,5 +1,6 @@
 .vscode/**
 .vscode-test/**
+.github/**
 .claude/**
 out/**
 node_modules/**
@@ -8,6 +9,8 @@ src/**
 plugin-package/**
 *.tgz
 .gitignore
+# vsce ships LICENSE as extension/LICENSE.txt; this duplicate would collide.
+LICENSE.txt
 .yarnrc
 esbuild.js
 vsc-extension-quickstart.md
