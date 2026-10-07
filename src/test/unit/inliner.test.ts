@@ -2,7 +2,10 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as ts from 'typescript';
 import { inlineImportsToText, resolveImportsToDeclarations } from '../../inliner';
+
+const EXCEL_TYPES = path.resolve(__dirname, '..', '..', '..', 'types', 'excel-script.d.ts');
 
 suite('inliner', () => {
     let dir: string;
@@ -26,6 +29,23 @@ suite('inliner', () => {
 
     const inline = (source: string[]) =>
         inlineImportsToText(path.join(dir, 'restock.osts'), source.join('\n') + '\n');
+
+    /** Type-checks inlined output against the ExcelScript types, as Excel would. */
+    function compileErrors(output: string): string[] {
+        const file = path.join(dir, 'inlined.ts');
+        fs.writeFileSync(file, output);
+        // The Office Scripts runtime supplies console.log; excel-script.d.ts doesn't declare it.
+        const runtime = path.join(dir, 'runtime.d.ts');
+        fs.writeFileSync(runtime, 'declare const console: { log(...data: unknown[]): void };\n');
+        const program = ts.createProgram([file, EXCEL_TYPES, runtime], {
+            strict: true,
+            noEmit: true,
+            target: ts.ScriptTarget.ES2020,
+            lib: ['lib.es2020.d.ts'],
+            types: [],
+        });
+        return ts.getPreEmitDiagnostics(program).map(d => ts.flattenDiagnosticMessageText(d.messageText, ' '));
+    }
 
     suite('inlineImportsToText', () => {
         test('replaces the import with the declaration, types first and helpers last', async () => {
@@ -88,6 +108,7 @@ suite('inliner', () => {
         test('follows imports inside helper files, emitting a shared helper once', async () => {
             project({
                 'shared/sheets.ts': [
+                    'import { chunk } from "lodash";',
                     'export function getSheet(wb: ExcelScript.Workbook, name: string) { return wb.getWorksheet(name); }',
                 ],
                 'receiving.ts': [
@@ -106,7 +127,8 @@ suite('inliner', () => {
                 'function main(workbook: ExcelScript.Workbook) { receive(workbook); ship(workbook); }',
             ]);
 
-            assert.deepStrictEqual(warnings, []);
+            // sheets.ts is reached twice but parsed once, so its warning appears once.
+            assert.deepStrictEqual(warnings, ['Skipped non-relative import "lodash"']);
             assert.strictEqual(output.split('function getSheet(').length - 1, 1);
             assert.ok(output.includes('function receive('));
             assert.ok(output.includes('function ship('));
@@ -179,21 +201,89 @@ suite('inliner', () => {
             ]);
         });
 
-        test('refuses aliased imports instead of emitting an undefined name', async () => {
-            project({
-                'batch.ts': ['export function formatBatchNumber(n: number): string { return `B-${n}`; }'],
+        suite('aliased imports', () => {
+            test('inline the original declaration plus an alias, and the result compiles', async () => {
+                project({
+                    'inventory.ts': [
+                        'export function formatBatchNumber(n: number): string { return `B-${n}`; }',
+                        'export interface InventoryRow { sku: string; qty: number; }',
+                        'export interface Shelf<T> { items: T[]; }',
+                        'export class Ledger { entries: string[] = []; }',
+                        'export enum Unit { Case, Pallet }',
+                    ],
+                });
+
+                const { output, warnings } = await inline([
+                    'import { formatBatchNumber as fmt, InventoryRow as Row, Shelf as Bin, Ledger as Log, Unit as U } from "./inventory";',
+                    '',
+                    'function main(workbook: ExcelScript.Workbook) {',
+                    '    const row: Row = { sku: fmt(1), qty: 3 };',
+                    '    const bin: Bin<Row> = { items: [row] };',
+                    '    const log: Log = new Log();',
+                    '    log.entries.push(workbook.getName(), String(bin.items.length), String(U.Pallet));',
+                    '}',
+                ]);
+
+                assert.deepStrictEqual(warnings, []);
+                for (const alias of [
+                    'const fmt = formatBatchNumber;',
+                    'type Row = InventoryRow;',
+                    'type Bin<T> = Shelf<T>;',
+                    'type Log = Ledger;',
+                    'const Log = Ledger;',
+                    'type U = Unit;',
+                    'const U = Unit;',
+                ]) {
+                    assert.ok(output.includes(alias), `missing: ${alias}`);
+                }
+                assert.deepStrictEqual(compileErrors(output), []);
             });
 
-            const { output, warnings } = await inline([
-                'import { formatBatchNumber as fmt } from "./batch";',
-                'function main(workbook: ExcelScript.Workbook) { console.log(fmt(42)); }',
-            ]);
+            test('work inside helper files, emitting a shared alias once', async () => {
+                project({
+                    'batch.ts': ['export function formatBatchNumber(n: number): string { return `B-${n}`; }'],
+                    'receiving.ts': [
+                        'import { formatBatchNumber as fmt } from "./batch";',
+                        'export function receive(): string { return fmt(1); }',
+                    ],
+                    'shipping.ts': [
+                        'import { formatBatchNumber as fmt } from "./batch";',
+                        'export function ship(): string { return fmt(2); }',
+                    ],
+                });
 
-            assert.deepStrictEqual(warnings, [
-                'Skipped aliased import "formatBatchNumber as fmt" from "./batch" — import it by its original name',
-            ]);
-            // The import stays visible in the output rather than silently vanishing.
-            assert.ok(output.includes('import { formatBatchNumber as fmt } from "./batch";'));
+                const { output, warnings } = await inline([
+                    'import { receive } from "./receiving";',
+                    'import { ship } from "./shipping";',
+                    'import { formatBatchNumber } from "./batch";',
+                    'function main(workbook: ExcelScript.Workbook) { console.log(receive(), ship(), formatBatchNumber(3)); }',
+                ]);
+
+                assert.deepStrictEqual(warnings, []);
+                assert.strictEqual(output.split('function formatBatchNumber(').length - 1, 1);
+                assert.strictEqual(output.split('const fmt = formatBatchNumber;').length - 1, 1);
+                assert.deepStrictEqual(compileErrors(output), []);
+            });
+
+            test('warn when the alias name is already taken', async () => {
+                project({
+                    'batch.ts': ['export function formatBatchNumber(n: number): string { return `B-${n}`; }'],
+                    'receiving.ts': [
+                        'import { formatBatchNumber as fmt } from "./batch";',
+                        'export function receive(): string { return fmt(1); }',
+                    ],
+                });
+
+                const { warnings } = await inline([
+                    'import { receive } from "./receiving";',
+                    'function fmt(s: string): string { return s.trim(); }',
+                    'function main(workbook: ExcelScript.Workbook) { console.log(fmt(receive())); }',
+                ]);
+
+                assert.deepStrictEqual(warnings, [
+                    'Cannot alias "formatBatchNumber" as "fmt" (from batch.ts): "fmt" is already defined',
+                ]);
+            });
         });
     });
 
@@ -208,7 +298,7 @@ suite('inliner', () => {
 
             const decls = await resolveImportsToDeclarations(
                 dir,
-                [{ specifier: './inventory', names: ['restock'] }],
+                [{ specifier: './inventory', bindings: [{ imported: 'restock', local: 'restock' }] }],
                 [],
             );
 

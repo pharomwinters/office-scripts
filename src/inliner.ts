@@ -13,13 +13,13 @@ import * as path from 'path';
  * non-exported helpers and types that the imported declarations depend on,
  * walking transitively across files. Type aliases and interfaces are
  * hoisted to the top of the output; other declarations are appended after
- * the original source.
+ * the original source. An aliased import (`import { a as b }`) inlines `a`
+ * and adds `const b = a;` and/or `type b = a;` after it.
  *
  * Not supported (warnings issued):
  *   - `import * as ns from ...` namespace imports
  *   - Default imports
  *   - Non-relative imports (node_modules, bare specifiers)
- *   - Aliased imports (`import { a as b }`)
  */
 
 /**
@@ -41,16 +41,25 @@ export async function inlineImportsToText(
     const fromDir = path.dirname(fileName);
 
     for (const imp of topImports) {
-        await resolveAndCollect(fromDir, imp.specifier, imp.names, collected, filesProcessed, reservedNames, warnings);
+        await resolveAndCollect(fromDir, imp.specifier, imp.bindings, collected, filesProcessed, reservedNames, warnings);
     }
 
     const output = stripImportsAndAssemble(source, topImports, collected);
     return { output, warnings };
 }
 
+/**
+ * One named import: `imported` is the name exported by the target file,
+ * `local` the name the importing file uses. They differ for `{ a as b }`.
+ */
+export interface ImportBinding {
+    imported: string;
+    local: string;
+}
+
 interface ImportInfo {
     specifier: string;
-    names: string[];
+    bindings: ImportBinding[];
     start: number;
     end: number;
 }
@@ -76,13 +85,13 @@ function allCollectedNames(c: Collected): Set<string> {
  */
 export async function resolveImportsToDeclarations(
     fromDir: string,
-    imports: { specifier: string; names: string[] }[],
+    imports: { specifier: string; bindings: ImportBinding[] }[],
     warnings: string[],
 ): Promise<Map<string, string>> {
     const collected = createCollected();
     const filesProcessed = new Map<string, Set<string>>();
     for (const imp of imports) {
-        await resolveAndCollect(fromDir, imp.specifier, imp.names, collected, filesProcessed, new Set(), warnings);
+        await resolveAndCollect(fromDir, imp.specifier, imp.bindings, collected, filesProcessed, new Set(), warnings);
     }
     const merged = new Map<string, string>();
     for (const [k, v] of collected.types) merged.set(k, v);
@@ -111,28 +120,19 @@ function collectImports(fileName: string, text: string, warnings: string[]): Imp
             warnings.push(`Skipped default import from "${specifier}"`);
         }
 
-        const names: string[] = [];
+        const bindings: ImportBinding[] = [];
         if (clause.namedBindings) {
             if (ts.isNamespaceImport(clause.namedBindings)) {
                 warnings.push(`Skipped namespace import from "${specifier}"`);
             } else if (ts.isNamedImports(clause.namedBindings)) {
                 for (const el of clause.namedBindings.elements) {
-                    // `{ a as b }`: the inlined declaration keeps the name `a`
-                    // while the importer calls `b`, so inlining would emit a
-                    // script referencing an undefined name. Refuse it loudly.
-                    if (el.propertyName && el.propertyName.text !== el.name.text) {
-                        warnings.push(
-                            `Skipped aliased import "${el.propertyName.text} as ${el.name.text}" from "${specifier}" — import it by its original name`,
-                        );
-                        continue;
-                    }
-                    names.push(el.name.text);
+                    bindings.push({ imported: (el.propertyName ?? el.name).text, local: el.name.text });
                 }
             }
         }
 
-        if (names.length > 0) {
-            imports.push({ specifier, names, start: stmt.getStart(sf), end: stmt.getEnd() });
+        if (bindings.length > 0) {
+            imports.push({ specifier, bindings, start: stmt.getStart(sf), end: stmt.getEnd() });
         }
     }
 
@@ -211,7 +211,7 @@ function collectIdentifierRefs(node: ts.Node): Set<string> {
 async function resolveAndCollect(
     fromDir: string,
     specifier: string,
-    requestedNames: string[],
+    requested: ImportBinding[],
     collected: Collected,
     filesProcessed: Map<string, Set<string>>,
     reservedNames: Set<string>,
@@ -228,8 +228,11 @@ async function resolveAndCollect(
         processed = new Set();
         filesProcessed.set(resolved, processed);
     }
-    const seedNames = requestedNames.filter(n => !processed!.has(n));
-    if (seedNames.length === 0) return;
+    // Names already processed were emitted (and their refs walked) by an
+    // earlier call. An alias for an already-inlined name still needs its
+    // alias declaration below, so only skip the file when there's none.
+    const seedNames = requested.map(b => b.imported).filter(n => !processed!.has(n));
+    if (seedNames.length === 0 && requested.every(b => b.local === b.imported)) return;
 
     const text = fs.readFileSync(resolved, 'utf8');
     const sf = ts.createSourceFile(resolved, text, ts.ScriptTarget.ES2020, true);
@@ -238,9 +241,9 @@ async function resolveAndCollect(
     const symbols = buildSymbolTable(sf);
 
     const nestedImports = collectImports(resolved, text, warnings);
-    const importedNameToSpec = new Map<string, string>();
+    const importsByLocal = new Map<string, { specifier: string; binding: ImportBinding }>();
     for (const ni of nestedImports) {
-        for (const n of ni.names) importedNameToSpec.set(n, ni.specifier);
+        for (const b of ni.bindings) importsByLocal.set(b.local, { specifier: ni.specifier, binding: b });
     }
 
     // Closure walk: starting from new requested (exported) names, expand to
@@ -250,7 +253,7 @@ async function resolveAndCollect(
     const closureOrder: string[] = [];
     const closure = new Set<string>();
     const queue: string[] = [];
-    const nestedNeeded = new Map<string, Set<string>>();
+    const nestedNeeded = new Map<string, Map<string, ImportBinding>>();
 
     for (const n of seedNames) {
         const sym = symbols.get(n);
@@ -281,14 +284,14 @@ async function resolveAndCollect(
                 if (!closure.has(r) && !processed.has(r)) queue.push(r);
                 continue;
             }
-            if (importedNameToSpec.has(r)) {
-                const spec = importedNameToSpec.get(r)!;
-                let bucket = nestedNeeded.get(spec);
+            const nested = importsByLocal.get(r);
+            if (nested) {
+                let bucket = nestedNeeded.get(nested.specifier);
                 if (!bucket) {
-                    bucket = new Set();
-                    nestedNeeded.set(spec, bucket);
+                    bucket = new Map();
+                    nestedNeeded.set(nested.specifier, bucket);
                 }
-                bucket.add(r);
+                bucket.set(r, nested.binding);
             }
         }
     }
@@ -344,17 +347,68 @@ async function resolveAndCollect(
         targetMap.set(finalName, snippet);
     }
 
+    for (const { imported, local } of requested) {
+        if (local === imported) continue;
+        const sym = symbols.get(imported);
+        if (!sym || !sym.isExported) continue; // already warned above
+        addAliasDecls(sym.stmt, imported, local, collected, reservedNames, fileLabel, warnings);
+    }
+
     // Recurse into nested imports — only with names actually referenced.
-    for (const [spec, names] of nestedNeeded) {
+    for (const [spec, bindings] of nestedNeeded) {
         await resolveAndCollect(
             path.dirname(resolved),
             spec,
-            [...names],
+            [...bindings.values()],
             collected,
             filesProcessed,
             reservedNames,
             warnings,
         );
+    }
+}
+
+/**
+ * Emits `const local = imported;` for a value and `type local = imported;`
+ * for a type (classes and enums are both). The value alias lands after the
+ * aliased declaration because both go to the values block in insertion order.
+ */
+function addAliasDecls(
+    stmt: ts.Statement,
+    imported: string,
+    local: string,
+    collected: Collected,
+    reservedNames: Set<string>,
+    fileLabel: string,
+    warnings: string[],
+): void {
+    const isClassOrEnum = ts.isClassDeclaration(stmt) || ts.isEnumDeclaration(stmt);
+    const isTypeOnly = ts.isInterfaceDeclaration(stmt) || ts.isTypeAliasDeclaration(stmt);
+
+    const decls: [Map<string, string>, string][] = [];
+    if (isTypeOnly || isClassOrEnum) {
+        // Generic types need their parameters: `type Box<T> = Container<T>;`.
+        const typeParams = 'typeParameters' in stmt
+            ? (stmt.typeParameters as ts.NodeArray<ts.TypeParameterDeclaration> | undefined)
+            : undefined;
+        const params = typeParams?.length ? `<${typeParams.map(p => p.getText()).join(', ')}>` : '';
+        const args = typeParams?.length ? `<${typeParams.map(p => p.name.text).join(', ')}>` : '';
+        decls.push([collected.types, `type ${local}${params} = ${imported}${args};`]);
+    }
+    if (!isTypeOnly) {
+        decls.push([collected.values, `const ${local} = ${imported};`]);
+    }
+
+    // Another file may already have emitted the very same alias.
+    if (decls.every(([target, text]) => target.get(local) === text)) {
+        return;
+    }
+    if (reservedNames.has(local) || collected.types.has(local) || collected.values.has(local)) {
+        warnings.push(`Cannot alias "${imported}" as "${local}" (from ${fileLabel}): "${local}" is already defined`);
+        return;
+    }
+    for (const [target, text] of decls) {
+        target.set(local, text);
     }
 }
 

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as ts from 'typescript';
 import * as fs from 'fs';
 import * as path from 'path';
-import { resolveImportsToDeclarations } from './inliner';
+import { ImportBinding, resolveImportsToDeclarations } from './inliner';
 import { isOfficeScriptFile } from './marker';
 
 /**
@@ -55,7 +55,7 @@ export async function splitFlows(doc: vscode.TextDocument): Promise<void> {
     const warnings: string[] = [];
     const written: string[] = [];
     for (const flow of flows) {
-        const { helperNames, importedNamesBySpecifier } = resolveDependencies(
+        const { helperNames, importedBySpecifier } = resolveDependencies(
             flow,
             topDecls,
             importsByName,
@@ -63,9 +63,9 @@ export async function splitFlows(doc: vscode.TextDocument): Promise<void> {
         );
         const importedDecls = await resolveImportsToDeclarations(
             sourceDir,
-            [...importedNamesBySpecifier].map(([specifier, names]) => ({
+            [...importedBySpecifier].map(([specifier, bindings]) => ({
                 specifier,
-                names: [...names],
+                bindings: [...bindings.values()],
             })),
             warnings,
         );
@@ -97,9 +97,9 @@ interface TopDecl {
     stmt: ts.Statement;
 }
 
-interface ImportBinding {
+interface ImportRef {
     specifier: string;
-    localName: string;
+    binding: ImportBinding;
 }
 
 function collectFlowFunctions(sf: ts.SourceFile): FlowFn[] {
@@ -146,8 +146,8 @@ function collectTopDeclarations(sf: ts.SourceFile, flows: FlowFn[]): Map<string,
     return map;
 }
 
-function collectImportsByName(sf: ts.SourceFile): Map<string, ImportBinding> {
-    const map = new Map<string, ImportBinding>();
+function collectImportsByName(sf: ts.SourceFile): Map<string, ImportRef> {
+    const map = new Map<string, ImportRef>();
 
     for (const stmt of sf.statements) {
         if (!ts.isImportDeclaration(stmt)) continue;
@@ -157,22 +157,21 @@ function collectImportsByName(sf: ts.SourceFile): Map<string, ImportBinding> {
         const specifier = stmt.moduleSpecifier.text;
 
         if (clause.name) {
-            map.set(clause.name.text, { specifier, localName: clause.name.text });
+            const name = clause.name.text;
+            map.set(name, { specifier, binding: { imported: name, local: name } });
         }
         if (clause.namedBindings) {
             if (ts.isNamespaceImport(clause.namedBindings)) {
-                map.set(clause.namedBindings.name.text, {
-                    specifier,
-                    localName: clause.namedBindings.name.text,
-                });
+                const name = clause.namedBindings.name.text;
+                map.set(name, { specifier, binding: { imported: name, local: name } });
             } else {
                 for (const el of clause.namedBindings.elements) {
                     // propertyName is the exported name; `name` is the local
-                    // binding. We pass the exported name to the resolver
-                    // because that's what it looks for in the target file.
+                    // binding. The resolver needs both: it looks up the
+                    // exported name and aliases it when the two differ.
                     map.set(el.name.text, {
                         specifier,
-                        localName: (el.propertyName ?? el.name).text,
+                        binding: { imported: (el.propertyName ?? el.name).text, local: el.name.text },
                     });
                 }
             }
@@ -184,12 +183,12 @@ function collectImportsByName(sf: ts.SourceFile): Map<string, ImportBinding> {
 function resolveDependencies(
     flow: FlowFn,
     topDecls: Map<string, TopDecl>,
-    importsByName: Map<string, ImportBinding>,
+    importsByName: Map<string, ImportRef>,
     flows: FlowFn[],
-): { helperNames: string[]; importedNamesBySpecifier: Map<string, Set<string>> } {
+): { helperNames: string[]; importedBySpecifier: Map<string, Map<string, ImportBinding>> } {
     const flowNames = new Set(flows.map(f => f.name));
     const helperNames = new Set<string>();
-    const importedNamesBySpecifier = new Map<string, Set<string>>();
+    const importedBySpecifier = new Map<string, Map<string, ImportBinding>>();
     const queue: ts.Node[] = [flow.stmt];
     const visited = new Set<string>();
 
@@ -202,14 +201,14 @@ function resolveDependencies(
             if (flowNames.has(name)) return; // don't pull in other flows
             if (name === 'main') return;
 
-            const binding = importsByName.get(name);
-            if (binding) {
-                let set = importedNamesBySpecifier.get(binding.specifier);
-                if (!set) {
-                    set = new Set<string>();
-                    importedNamesBySpecifier.set(binding.specifier, set);
+            const ref = importsByName.get(name);
+            if (ref) {
+                let bindings = importedBySpecifier.get(ref.specifier);
+                if (!bindings) {
+                    bindings = new Map<string, ImportBinding>();
+                    importedBySpecifier.set(ref.specifier, bindings);
                 }
-                set.add(binding.localName);
+                bindings.set(name, ref.binding);
             }
             if (topDecls.has(name)) {
                 helperNames.add(name);
@@ -218,7 +217,7 @@ function resolveDependencies(
         });
     }
 
-    return { helperNames: [...helperNames], importedNamesBySpecifier };
+    return { helperNames: [...helperNames], importedBySpecifier };
 }
 
 function collectReferencedIdentifiers(node: ts.Node, visit: (name: string) => void): void {
