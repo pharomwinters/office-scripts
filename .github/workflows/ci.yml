@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Lint, unit test & package VSIX
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check-types
+      - run: npm run lint
+
+      - name: Unit tests
+        run: |
+          npm run compile-tests
+          npm run test:unit
+
+      # `vsce package` runs vscode:prepublish, i.e. the production esbuild.
+      - name: Package VSIX
+        run: npm run vsix
+
+      # The TS server plugin only works if the shim, the bundled plugin and the
+      # ambient types all make it into the archive — guard the layout.
+      - name: Verify VSIX contents
+        run: |
+          vsix=$(ls *.vsix)
+          unzip -l "$vsix"
+          for f in \
+            extension/dist/extension.js \
+            extension/dist/plugin.js \
+            extension/types/excel-script.d.ts \
+            extension/node_modules/office-scripts-plugin/index.js \
+            extension/node_modules/office-scripts-plugin/package.json; do
+            unzip -l "$vsix" | grep -q " $f\$" || { echo "::error::$f missing from $vsix"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: office-scripts-vsix
+          path: '*.vsix'
+          if-no-files-found: error
+
+  integration:
+    name: Integration tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Downloads VS Code and runs out/test/*.test.js inside it (see .vscode-test.mjs).
+      - name: Run tests (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm test
+
+      - name: Run tests
+        if: runner.os != 'Linux'
+        run: npm test
