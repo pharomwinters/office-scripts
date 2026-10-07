@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as ts from 'typescript';
 import * as fs from 'fs';
 import * as path from 'path';
-import { resolveImportsToDeclarations } from './inlineImports';
+import { resolveImportsToDeclarations } from './inliner';
 import { isOfficeScriptFile } from './marker';
 
 /**
